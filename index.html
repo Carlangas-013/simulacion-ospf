@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulación de Enrutamiento OSPF (SimPy)</title>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+        .container { max-width: 1100px; margin: auto; display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
+        .card { background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; }
+        h1 { grid-column: 1 / -1; margin: 0 0 10px 0; font-size: 1.5rem; color: #38bdf8; }
+        label { display: block; font-size: 0.85rem; margin-top: 12px; color: #cbd5e1; }
+        input[type="number"] { width: 100%; padding: 8px; margin-top: 4px; border-radius: 5px; border: 1px solid #475569; background: #0f172a; color: white; box-sizing: border-box; }
+        .checkbox-group { display: flex; align-items: center; gap: 8px; margin-top: 15px; }
+        button { width: 100%; padding: 12px; margin-top: 20px; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 1rem; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        button:hover:not(:disabled) { background: #0369a1; }
+        .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
+        .metric-box { background: #0f172a; padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #334155; }
+        .metric-val { font-size: 1.3rem; font-weight: bold; color: #38bdf8; }
+        .metric-lbl { font-size: 0.75rem; color: #94a3b8; }
+        pre { background: #0f172a; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; color: #a7f3d0; border: 1px solid #334155; }
+        canvas { background: #0f172a; border-radius: 8px; border: 1px solid #334155; width: 100%; height: 420px; }
+        @media (max-width: 800px) { .container { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Simulación de Enrutamiento con Fallas Aleatorias (SimPy)</h1>
+
+    <!-- Panel de Control -->
+    <div class="card">
+        <h3 style="margin-top:0">Parámetros</h3>
+        <label>Tasa de llegada λ (paq/s): <input type="number" id="lam" value="20"></label>
+        <label>MTBF (seg): <input type="number" id="mtbf" value="900"></label>
+        <label>MTTR (seg): <input type="number" id="mttr" value="60"></label>
+        <label>Dead Interval OSPF (seg): <input type="number" id="dead" value="40"></label>
+        <label>Carga ρ (0.1 - 0.99): <input type="number" id="rho" value="0.6" step="0.05" max="0.99"></label>
+        <label>Horizonte (seg): <input type="number" id="horizonte" value="3600"></label>
+        <label>Semilla aleatoria: <input type="number" id="semilla" value="42"></label>
+        
+        <div class="checkbox-group">
+            <input type="checkbox" id="redundante">
+            <label for="redundante" style="margin:0">Añadir enlace redundante (PIU–CAJ)</label>
+        </div>
+
+        <button id="btn-run" disabled onclick="ejecutarSimulacion()">Cargando Python y SimPy...</button>
+    </div>
+
+    <!-- Resultados y Mapa -->
+    <div class="card">
+        <div class="metrics">
+            <div class="metric-box"><div class="metric-val" id="m-enviados">-</div><div class="metric-lbl">Paquetes Enviados</div></div>
+            <div class="metric-box"><div class="metric-val" id="m-din">-</div><div class="metric-lbl">Entrega Dinámico (OSPF)</div></div>
+            <div class="metric-box"><div class="metric-val" id="m-est">-</div><div class="metric-lbl">Entrega Estático</div></div>
+            <div class="metric-box"><div class="metric-val" id="m-lat">-</div><div class="metric-lbl">Latencia Media Dinámica</div></div>
+            <div class="metric-box"><div class="metric-val" id="m-fallas">-</div><div class="metric-lbl">Fallas Totales</div></div>
+            <div class="metric-box"><div class="metric-val" id="m-det">-</div><div class="metric-lbl">Fallas Detectadas</div></div>
+        </div>
+
+        <canvas id="mapaRed" width="600" height="420"></canvas>
+
+        <h4>Log de primeros paquetes:</h4>
+        <pre id="salida-log">Esperando ejecución...</pre>
+    </div>
+</div>
+
+<script>
+    let pyodide;
+
+    // Código Python original adaptado para devolver datos al navegador
+    const codigoPython = `
+import heapq, math, random, statistics, json
+import simpy
+
+NODOS = {'PIU': (-5.19, -80.63), 'CIX': (-6.77, -79.84), 'CAJ': (-7.16, -78.51), 'TRU': (-8.11, -79.03),
+         'LIM': (-12.05, -77.04), 'HYO': (-12.07, -75.21), 'ICA': (-14.07, -75.73), 'AYA': (-13.16, -74.22),
+         'CUZ': (-13.53, -71.97), 'AQP': (-16.41, -71.54), 'PUN': (-15.84, -70.02), 'TCQ': (-18.01, -70.25)}
+ENLACES = [('PIU', 'CIX'), ('CIX', 'CAJ'), ('CIX', 'TRU'), ('CAJ', 'TRU'), ('TRU', 'LIM'), ('CAJ', 'LIM'),
+           ('LIM', 'HYO'), ('LIM', 'ICA'), ('HYO', 'AYA'), ('ICA', 'AYA'), ('ICA', 'AQP'), ('AYA', 'CUZ'),
+           ('CUZ', 'AQP'), ('CUZ', 'PUN'), ('AQP', 'PUN'), ('AQP', 'TCQ'), ('PUN', 'TCQ')]
+
+def km(a, b):
+    (la1, lo1), (la2, lo2) = NODOS[a], NODOS[b]
+    p = math.pi / 180
+    h = math.sin((la2 - la1) * p / 2) ** 2 + math.cos(la1 * p) * math.cos(la2 * p) * math.sin((lo2 - lo1) * p / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+def construir_grafo(redundante=False):
+    lista = ENLACES + ([('PIU', 'CAJ')] if redundante else [])
+    prop = [km(a, b) * 1.4 * 5 / 1000 for a, b in lista]
+    ady = {v: [] for v in NODOS}
+    for i, (a, b) in enumerate(lista):
+        ady[a].append((b, i)); ady[b].append((a, i))
+    return lista, prop, ady
+
+def dijkstra(origen, ady, prop, activo):
+    dist, prev, cola = {origen: 0.0}, {}, [(0.0, origen)]
+    while cola:
+        d, u = heapq.heappop(cola)
+        if d > dist[u]:
+            continue
+        for v, e in ady[u]:
+            if activo[e] and d + prop[e] < dist.get(v, math.inf):
+                dist[v] = d + prop[e]; prev[v] = (u, e); heapq.heappush(cola, (dist[v], v))
+    rutas = {}
+    for v in NODOS:
+        if v == origen or v not in dist:
+            continue
+        camino, x = [], v
+        while x != origen:
+            u, e = prev[x]; camino.append(e); x = u
+        rutas[v] = camino[::-1]
+    return rutas
+
+def tablas(ady, prop, activo):
+    return {o: dijkstra(o, ady, prop, activo) for o in NODOS}
+
+def simular(lam=20, mtbf=900, mttr=60, dead=40, rho=0.6, redundante=False, horizonte=3600, semilla=42):
+    rnd = random.Random(semilla)
+    lista, prop, ady = construir_grafo(redundante)
+    M, hello, mu = len(lista), dead / 4, 1000.0
+    real = [True] * M
+    conocido = [True] * M
+    est = {'tab': tablas(ady, prop, conocido)}
+    estatico = tablas(ady, prop, [True] * M)
+    s2 = math.log(2.0); mu_ln = math.log(mttr) - s2 / 2
+    w = 1 / (mu * (1 - rho)) * 1000
+    log, cont = [], {'din': [0, 0, 0], 'est': [0, 0]}
+    lat_din, lat_est, fallas = [], [], [0, 0]
+    env = simpy.Environment()
+
+    def recalcular():
+        est['tab'] = tablas(ady, prop, conocido)
+
+    def detectar(e, cuando, valor, id_falla):
+        yield env.timeout(cuando)
+        if valor is False and real[e]:
+            return
+        if valor is False:
+            fallas[1] += 1
+        conocido[e] = valor; recalcular()
+
+    def enlace(e):
+        while True:
+            yield env.timeout(rnd.expovariate(1 / mtbf))
+            real[e] = False; fallas[0] += 1
+            reparacion = math.exp(rnd.gauss(mu_ln, math.sqrt(s2)))
+            env.process(detectar(e, rnd.uniform(dead - hello, dead) + 0.2, False, fallas[0]))
+            yield env.timeout(reparacion)
+            real[e] = True
+            if not conocido[e]:
+                env.process(detectar(e, rnd.uniform(0, hello) + 0.2, True, None))
+
+    def recorrer(camino):
+        t = 0.0
+        for e in camino:
+            if not real[e]:
+                return None, e
+            t += prop[e] + rnd.expovariate(1 / w)
+        return t, None
+
+    def generador():
+        i = 0
+        nodos = list(NODOS)
+        while True:
+            yield env.timeout(rnd.expovariate(lam))
+            i += 1
+            o, d = rnd.sample(nodos, 2)
+            camino = est['tab'][o].get(d)
+            if camino is None:
+                cont['din'][2] += 1; res = 'SIN RUTA'
+            else:
+                t, caido = recorrer(camino)
+                if t is None:
+                    cont['din'][1] += 1; res = 'PERDIDO en ' + '–'.join(lista[caido])
+                else:
+                    cont['din'][0] += 1; lat_din.append(t); res = f'ENTREGADO {t:.2f} ms'
+            t2, _ = recorrer(estatico[o][d])
+            if t2 is None: cont['est'][1] += 1
+            else: cont['est'][0] += 1; lat_est.append(t2)
+            if len(log) < 10:
+                log.append(f"Paq #{i:02d} | t={env.now:6.2f}s | {o}->{d} ({len(camino) if camino else 0} saltos) | {res}")
+
+    for e in range(M):
+        env.process(enlace(e))
+    env.process(generador())
+    env.run(until=horizonte)
+    n = sum(cont['din'])
+    return json.dumps({
+        'enviados': n,
+        'entrega_din': round(100 * cont['din'][0] / n, 2) if n else 0,
+        'entrega_est': round(100 * cont['est'][0] / n, 2) if n else 0,
+        'lat_din': round(statistics.mean(lat_din), 2) if lat_din else 0,
+        'fallas': fallas[0],
+        'detectadas': fallas[1],
+        'log': log,
+        'nodos': NODOS,
+        'enlaces': lista,
+        'estado_final': real
+    })
+`;
+
+    async function iniciarPyodide() {
+        pyodide = await loadPyodide();
+        await pyodide.loadPackage("micropip");
+        const micropip = pyodide.pyimport("micropip");
+        await micropip.install("simpy");
+        await pyodide.runPythonAsync(codigoPython);
+
+        const btn = document.getElementById("btn-run");
+        btn.disabled = false;
+        btn.innerText = "Ejecutar Simulación";
+        ejecutarSimulacion(); // Corre una simulación inicial automática
+    }
+
+    async function ejecutarSimulacion() {
+        const lam = parseFloat(document.getElementById("lam").value);
+        const mtbf = parseFloat(document.getElementById("mtbf").value);
+        const mttr = parseFloat(document.getElementById("mttr").value);
+        const dead = parseFloat(document.getElementById("dead").value);
+        const rho = parseFloat(document.getElementById("rho").value);
+        const horizonte = parseFloat(document.getElementById("horizonte").value);
+        const semilla = parseInt(document.getElementById("semilla").value);
+        const redundante = document.getElementById("redundante").checked ? "True" : "False";
+
+        const cmd = `simular(lam=${lam}, mtbf=${mtbf}, mttr=${mttr}, dead=${dead}, rho=${rho}, redundante=${redundante}, horizonte=${horizonte}, semilla=${semilla})`;
+        const resJson = await pyodide.runPythonAsync(cmd);
+        const data = JSON.parse(resJson);
+
+        document.getElementById("m-enviados").innerText = data.enviados;
+        document.getElementById("m-din").innerText = data.entrega_din + " %";
+        document.getElementById("m-est").innerText = data.entrega_est + " %";
+        document.getElementById("m-lat").innerText = data.lat_din + " ms";
+        document.getElementById("m-fallas").innerText = data.fallas;
+        document.getElementById("m-det").innerText = data.detectadas;
+        document.getElementById("salida-log").innerText = data.log.join("\n");
+
+        dibujarGrafo(data.nodos, data.enlaces, data.estado_final);
+    }
+
+    function dibujarGrafo(nodos, enlaces, estadoFinal) {
+        const canvas = document.getElementById("mapaRed");
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Convertir lat/lon a coordenadas del canvas
+        const proyectar = ([lat, lon]) => {
+            const x = ((lon - (-81.5)) / ((-69.0) - (-81.5))) * (canvas.width - 80) + 40;
+            const y = ((lat - (-4.5)) / ((-19.0) - (-4.5))) * (canvas.height - 60) + 30;
+            return [x, y];
+        };
+
+        // Dibujar enlaces
+        enlaces.forEach(([u, v], idx) => {
+            const [x1, y1] = proyectar(nodos[u]);
+            const [x2, y2] = proyectar(nodos[v]);
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = estadoFinal[idx] ? "#38bdf8" : "#ef4444";
+            ctx.lineWidth = estadoFinal[idx] ? 2.5 : 3;
+            ctx.setLineDash(estadoFinal[idx] ? [] : [6, 4]);
+            ctx.stroke();
+        });
+        ctx.setLineDash([]);
+
+        // Dibujar routers
+        for (const [nombre, coords] of Object.entries(nodos)) {
+            const [x, y] = proyectar(coords);
+            ctx.beginPath();
+            ctx.arc(x, y, 7, 0, Math.PI * 2);
+            ctx.fillStyle = "#f8fafc";
+            ctx.fill();
+            ctx.strokeStyle = "#0284c7";
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            ctx.fillStyle = "#e2e8f0";
+            ctx.font = "bold 12px sans-serif";
+            ctx.fillText(nombre, x + 10, y + 4);
+        }
+    }
+
+    iniciarPyodide();
+</script>
+</body>
+</html>
